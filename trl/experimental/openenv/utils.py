@@ -87,9 +87,10 @@ def _build_server_generation_kwargs(
 
 def generate_rollout_completions(
     trainer,
-    prompts: list[str],
+    prompts: list[str] | list[list[dict]],
     *,
     generation_overrides: dict[str, Any] | None = None,
+    chat_kwargs: dict[str, Any] | None = None,
     as_chat: bool | None = None,
 ) -> list[dict[str, Any]]:
     """
@@ -97,6 +98,31 @@ def generate_rollout_completions(
 
     Returns one result per prompt, containing prompt and completion token ids along with per-token log probabilities
     and the generated text.
+
+    Args:
+        trainer:
+            The trainer instance. Must have `use_vllm=True`.
+        prompts (`list[str]` or `list[list[dict]]`):
+            Either a list of prompt strings (non-chat) or a list of message lists (chat format, each message being a
+            dict with `role` and `content` keys).
+        generation_overrides (`dict`, *optional*):
+            Overrides for sampling parameters (e.g. `temperature`, `max_tokens`, `top_k`). Merged on top of trainer
+            defaults. Mirrors the `generation_kwargs` trainer config option but applied per-call.
+        chat_kwargs (`dict`, *optional*):
+            Overrides for chat-specific parameters. Merged on top of trainer defaults. Supported keys:
+            - `tools` (`list`): Tool definitions to attach to the chat call. Overrides `trainer.tools`.
+            - `chat_template` (`str`): Chat template string. Overrides `trainer.chat_template`.
+            - `chat_template_kwargs` (`dict`): Extra keyword arguments forwarded to the chat template renderer.
+              Merged on top of `trainer.chat_template_kwargs`.
+        as_chat (`bool`, *optional*):
+            Whether to use the chat API. Auto-detected from the first prompt if `None`.
+
+    Returns:
+        `list[dict]` where each dict has keys:
+            - `prompt_ids` (`list[int]`): Token ids of the prompt.
+            - `completion_ids` (`list[int]`): Token ids of the generated completion.
+            - `logprobs` (`list[float]`): Per-token log probabilities.
+            - `text` (`str`): Decoded completion text.
     """
 
     if not prompts:
@@ -106,17 +132,18 @@ def generate_rollout_completions(
         raise RuntimeError("Custom rollouts require vLLM to call generate_rollout_completions.")
 
     if trainer.vllm_mode == "server":
-        return _generate_rollout_completions_server(trainer, prompts, generation_overrides, as_chat)
+        return _generate_rollout_completions_server(trainer, prompts, generation_overrides, chat_kwargs, as_chat)
     elif trainer.vllm_mode == "colocate":
-        return _generate_rollout_completions_colocate(trainer, prompts, generation_overrides, as_chat)
+        return _generate_rollout_completions_colocate(trainer, prompts, generation_overrides, chat_kwargs, as_chat)
     else:
         raise ValueError(f"vllm_mode must be 'server' or 'colocate', got '{trainer.vllm_mode}'")
 
 
 def _generate_rollout_completions_server(
     trainer,
-    prompts: list[str],
+    prompts: list[str] | list[list[dict]],
     generation_overrides: dict[str, Any] | None = None,
+    chat_kwargs: dict[str, Any] | None = None,
     as_chat: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Generate completions using vLLM server mode."""
@@ -127,13 +154,17 @@ def _generate_rollout_completions_server(
 
     with profiling_context(trainer, "vLLM.generate_rollout_server"):
         if as_chat:
+            chat_kwargs = chat_kwargs or {}
+            tools = chat_kwargs.get("tools", trainer.tools or None)
+            chat_template = chat_kwargs.get("chat_template", trainer.chat_template)
+            merged_ctk = {**trainer.chat_template_kwargs, **chat_kwargs.get("chat_template_kwargs", {})}
             # Prompts are raw message dicts; use .chat() so the vLLM server applies the chat template
             output = trainer.vllm_generation.vllm_client.chat(
                 messages=prompts,
                 **generation_kwargs,
-                chat_template_kwargs=trainer.chat_template_kwargs,
-                tools=trainer.tools or None,
-                chat_template=trainer.chat_template,
+                chat_template_kwargs=merged_ctk or None,
+                tools=tools,
+                chat_template=chat_template,
             )
         else:
             output = trainer.vllm_generation.vllm_client.generate(prompts=prompts, **generation_kwargs)
@@ -155,8 +186,9 @@ def _generate_rollout_completions_server(
 
 def _generate_rollout_completions_colocate(
     trainer,
-    prompts: list[str],
+    prompts: list[str] | list[list[dict]],
     generation_overrides: dict[str, Any] | None = None,
+    chat_kwargs: dict[str, Any] | None = None,
     as_chat: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Generate completions using vLLM colocate mode."""
@@ -179,8 +211,19 @@ def _generate_rollout_completions_colocate(
 
     with profiling_context(trainer, "vLLM.generate_rollout"):
         if as_chat:
+            chat_kwargs = chat_kwargs or {}
+            tools = chat_kwargs.get("tools", trainer.tools or None)
+            chat_template = chat_kwargs.get("chat_template", trainer.chat_template)
+            merged_ctk = dict(trainer.chat_template_kwargs)
+            if tools:
+                merged_ctk["tools"] = tools
+            merged_ctk.update(chat_kwargs.get("chat_template_kwargs", {}))
             vllm_outputs = trainer.vllm_generation.llm.chat(
-                prompts_for_generation, sampling_params=sampling_params, use_tqdm=False
+                prompts_for_generation,
+                sampling_params=sampling_params,
+                use_tqdm=False,
+                chat_template=chat_template or None,
+                chat_template_kwargs=merged_ctk or None,
             )
         else:
             vllm_outputs = trainer.vllm_generation.llm.generate(
