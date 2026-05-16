@@ -166,7 +166,6 @@ class VLLMClient:
             self.server_port = server_port
             self.base_url = f"http://{self.host}:{self.server_port}"
         self.group_port = group_port
-        self._async_session: aiohttp.ClientSession | None = None
         self.check_server(connection_timeout)  # check server and fail after timeout
 
     def check_server(self, total_timeout: float = 0.0, retry_interval: float = 2.0):
@@ -417,11 +416,6 @@ class VLLMClient:
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
-    async def _get_async_session(self) -> "aiohttp.ClientSession":
-        if self._async_session is None or self._async_session.closed:
-            self._async_session = aiohttp.ClientSession()
-        return self._async_session
-
     async def agenerate(
         self,
         prompts: list[str] | list[list[int]],
@@ -490,8 +484,7 @@ class VLLMClient:
                 [pil_to_base64(img) for img in img_list] if img_list is not None else None for img_list in images
             ]
 
-        session = await self._get_async_session()
-        async with session.post(
+        async with aiohttp.ClientSession() as session, session.post(
             url,
             json={
                 "prompts": prompts,
@@ -604,8 +597,7 @@ class VLLMClient:
         if isinstance(tools, list) and len(tools) > 0:
             tools = [get_json_schema(tool) if callable(tool) else tool for tool in tools]
 
-        session = await self._get_async_session()
-        async with session.post(
+        async with aiohttp.ClientSession() as session, session.post(
             url,
             json={
                 "messages": messages,
