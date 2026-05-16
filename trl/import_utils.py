@@ -94,6 +94,10 @@ def is_pydantic_available() -> bool:
     return _is_package_available("pydantic")
 
 
+def is_aiohttp_available() -> bool:
+    return _is_package_available("aiohttp")
+
+
 def is_requests_available() -> bool:
     return _is_package_available("requests")
 

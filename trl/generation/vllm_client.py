@@ -29,8 +29,11 @@ from transformers import is_torch_xpu_available
 from transformers.utils import get_json_schema
 from urllib3.util.retry import Retry
 
-from ..import_utils import is_requests_available, is_vllm_ascend_available, is_vllm_available
+from ..import_utils import is_aiohttp_available, is_requests_available, is_vllm_ascend_available, is_vllm_available
 
+
+if is_aiohttp_available():
+    import aiohttp
 
 if is_requests_available():
     import requests
@@ -163,6 +166,7 @@ class VLLMClient:
             self.server_port = server_port
             self.base_url = f"http://{self.host}:{self.server_port}"
         self.group_port = group_port
+        self._async_session: aiohttp.ClientSession | None = None
         self.check_server(connection_timeout)  # check server and fail after timeout
 
     def check_server(self, total_timeout: float = 0.0, retry_interval: float = 2.0):
@@ -412,6 +416,224 @@ class VLLMClient:
             }
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
+
+    async def _get_async_session(self) -> "aiohttp.ClientSession":
+        if self._async_session is None or self._async_session.closed:
+            self._async_session = aiohttp.ClientSession()
+        return self._async_session
+
+    async def agenerate(
+        self,
+        prompts: list[str] | list[list[int]],
+        images: list | None = None,
+        n: int = 1,
+        repetition_penalty: float = 1.0,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        max_tokens: int = 16,
+        logprobs: int | None = 0,
+        structured_outputs_regex: str | None = None,
+        generation_kwargs: dict | None = None,
+    ) -> dict[str, list[list[int]]]:
+        """
+        Async version of `generate`. Generates model completions for the provided prompts.
+
+        Args:
+            prompts (`list[str]` or `list[list[int]]`):
+                List of text prompts or list of token ID lists for which the model will generate completions.
+            images (`list[list[PIL.Image] | None]`, *optional*):
+                List of image lists for VLM support. Each element is a list of PIL images for the corresponding prompt,
+                or `None` if no images for that prompt.
+            n (`int`, *optional*, defaults to `1`):
+                Number of completions to generate for each prompt.
+            repetition_penalty (`float`, *optional*, defaults to `1.0`):
+                Parameter for repetition penalty. 1.0 means no penalty.
+            temperature (`float`, *optional*, defaults to `1.0`):
+                Temperature parameter for sampling. Higher values increase diversity.
+            top_p (`float`, *optional*, defaults to `1.0`):
+                Top-p sampling parameter.`1.0` means no truncation.
+            top_k (`int`, *optional*, defaults to `0`):
+                Top-k sampling parameter. `0` means no truncation.
+            min_p (`float`, *optional*, defaults to `0.0`):
+                Minimum probability for sampling.
+            max_tokens (`int`, *optional*, defaults to `16`):
+                Maximum number of tokens to generate for each prompt.
+            logprobs (`int` or `None`, *optional*, defaults to `0`):
+                Number of top logprobs to return per token. When 0, only the sampled token's logprob is returned. When
+                N>0, returns up to N+1 logprobs sorted by descending probability, because vLLM always includes the
+                sampled token's logprob (which may fall outside the top-N).
+            structured_outputs_regex (`str`, *optional*):
+                Regular expression to guide the decoding process.
+            generation_kwargs (`dict`, *optional*):
+                Additional generation parameters to pass to the vLLM `SamplingParams`. This can include parameters like
+                `seed`, `frequency_penalty`, etc. If it contains keys that conflict with the other parameters, they
+                will override them.
+
+        Returns:
+            `dict` with keys:
+                - `prompt_ids` (`list[list[int]]`):
+                    List of lists of token IDs representing the tokenized input prompts.
+                - `completion_ids` (`list[list[int]]`):
+                    List of lists of token IDs representing the model-generated completions for each prompt.
+                - `logprobs` (`list[list[list[float]]]`):
+                    Per-token logprobs of shape (num_sequences, seq_len, num_logprobs), sorted by descending
+                    probability.
+                - `logprob_token_ids` (`list[list[list[int]]]`):
+                    Token IDs corresponding to each logprob, same shape as `logprobs`.
+        """
+        url = f"{self.base_url}/generate/"
+
+        if images:
+            images = [
+                [pil_to_base64(img) for img in img_list] if img_list is not None else None for img_list in images
+            ]
+
+        session = await self._get_async_session()
+        async with session.post(
+            url,
+            json={
+                "prompts": prompts,
+                "images": images,
+                "n": n,
+                "repetition_penalty": repetition_penalty,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "min_p": min_p,
+                "max_tokens": max_tokens,
+                "logprobs": logprobs,
+                "structured_outputs_regex": structured_outputs_regex,
+                "generation_kwargs": generation_kwargs or {},
+            },
+        ) as response:
+            if response.status == 200:
+                json_response = await response.json()
+                return {
+                    "prompt_ids": json_response["prompt_ids"],
+                    "completion_ids": json_response["completion_ids"],
+                    "logprobs": json_response["logprobs"],
+                    "logprob_token_ids": json_response["logprob_token_ids"],
+                }
+            else:
+                text = await response.text()
+                raise Exception(f"Request failed: {response.status}, {text}")
+
+    async def achat(
+        self,
+        messages: list[list[dict]],
+        n: int = 1,
+        repetition_penalty: float = 1.0,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        max_tokens: int = 16,
+        logprobs: int | None = 0,
+        structured_outputs_regex: str | None = None,
+        generation_kwargs: dict | None = None,
+        chat_template_kwargs: dict | None = None,
+        tools: list | None = None,
+        chat_template: str | None = None,
+    ) -> dict[str, list[list[int]]]:
+        """
+        Async version of `chat`. Generates model completions for the provided chat messages.
+
+        Args:
+            messages (`list[list[dict]]`):
+                List of message lists for which the model will generate completions. Each message is a dictionary with
+                keys like "role" and "content".
+            n (`int`, *optional*, defaults to `1`):
+                Number of completions to generate for each message list.
+            repetition_penalty (`float`, *optional*, defaults to `1.0`):
+                Parameter for repetition penalty. 1.0 means no penalty.
+            temperature (`float`, *optional*, defaults to `1.0`):
+                Temperature parameter for sampling. Higher values increase diversity.
+            top_p (`float`, *optional*, defaults to `1.0`):
+                Top-p sampling parameter.`1.0` means no truncation.
+            top_k (`int`, *optional*, defaults to `0`):
+                Top-k sampling parameter. `0` means no truncation.
+            min_p (`float`, *optional*, defaults to `0.0`):
+                Minimum probability for sampling.
+            max_tokens (`int`, *optional*, defaults to `16`):
+                Maximum number of tokens to generate for each message list.
+            logprobs (`int` or `None`, *optional*, defaults to `0`):
+                Number of top logprobs to return per token. When 0, only the sampled token's logprob is returned. When
+                N>0, returns up to N+1 logprobs sorted by descending probability, because vLLM always includes the
+                sampled token's logprob (which may fall outside the top-N).
+            structured_outputs_regex (`str`, *optional*):
+                Regular expression to guide the decoding process.
+            generation_kwargs (`dict`, *optional*):
+                Additional generation parameters to pass to the vLLM `SamplingParams`. This can include parameters like
+                `seed`, `frequency_penalty`, etc. If it contains keys that conflict with the other parameters, they
+                will override them.
+            chat_template_kwargs (`dict`, *optional*):
+                Additional keyword arguments to customize the chat template used by the model.
+            tools (`list[dict | Callable]`, *optional*):
+                List of tool functions available for tool calling during chat generation.
+            chat_template (`str`, *optional*):
+                Template to use for structuring the chat. If not provided, the model's default chat template will be
+                used.
+
+        Returns:
+            `dict` with keys:
+                - `prompt_ids` (`list[list[int]]`):
+                    List of lists of token IDs representing the tokenized input messages.
+                - `completion_ids` (`list[list[int]]`):
+                    List of lists of token IDs representing the model-generated completions for each message list.
+                - `logprobs` (`list[list[list[float]]]`):
+                    Per-token logprobs of shape (num_sequences, seq_len, num_logprobs), sorted by descending
+                    probability.
+                - `logprob_token_ids` (`list[list[list[int]]]`):
+                    Token IDs corresponding to each logprob, same shape as `logprobs`.
+        """
+        if chat_template is not None:
+            raise NotImplementedError("Custom chat templates are not yet implemented in VLLMClient.achat().")
+
+        url = f"{self.base_url}/chat/"
+
+        messages = copy.deepcopy(messages)
+        for message_list in messages:
+            for message in message_list:
+                if isinstance(message["content"], list):
+                    for part in message["content"]:
+                        if part["type"] == "image_pil":
+                            part["image_pil"] = pil_to_base64(part["image_pil"])
+
+        if isinstance(tools, list) and len(tools) > 0:
+            tools = [get_json_schema(tool) if callable(tool) else tool for tool in tools]
+
+        session = await self._get_async_session()
+        async with session.post(
+            url,
+            json={
+                "messages": messages,
+                "n": n,
+                "repetition_penalty": repetition_penalty,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "min_p": min_p,
+                "max_tokens": max_tokens,
+                "logprobs": logprobs,
+                "structured_outputs_regex": structured_outputs_regex,
+                "generation_kwargs": generation_kwargs or {},
+                "chat_template_kwargs": chat_template_kwargs or {},
+                "tools": tools,
+            },
+        ) as response:
+            if response.status == 200:
+                json_response = await response.json()
+                return {
+                    "prompt_ids": json_response["prompt_ids"],
+                    "completion_ids": json_response["completion_ids"],
+                    "logprobs": json_response["logprobs"],
+                    "logprob_token_ids": json_response["logprob_token_ids"],
+                }
+            else:
+                text = await response.text()
+                raise Exception(f"Request failed: {response.status}, {text}")
 
     def init_communicator(self, device: torch.device | str | int = 0):
         """

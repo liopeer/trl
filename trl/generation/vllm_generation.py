@@ -21,7 +21,7 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
-from accelerate.utils import broadcast_object_list, gather_object, is_peft_model
+from accelerate.utils import is_peft_model
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, is_bitsandbytes_available
@@ -518,7 +518,7 @@ class VLLMGeneration:
         elif self.mode == "colocate":
             self.llm.reset_prefix_cache()
 
-    def generate(
+    async def generate(
         self,
         prompts: list[list[int]],
         images: list[list | None] | None,
@@ -546,7 +546,6 @@ class VLLMGeneration:
             and may fall outside the top-N).
         """
         profiler = profiler or nullcontext()
-        accelerator = self.accelerator
         temperature = self.temperature
         top_p = self.top_p
         top_k = self.top_k
@@ -565,66 +564,32 @@ class VLLMGeneration:
                 # Non-CUDA vLLM backends (e.g., vllm-ascend's NPUWorkerV1), don't implement reload_weights
                 pass
 
-        # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+        # Generate completions using vLLM server: each caller sends its own prompts directly via async HTTP.
+        # Unlike the old batch path, there is no gather_object / broadcast_object_list here — concurrent async
+        # rollouts call generate() independently and the vLLM server's continuous batching handles concurrency.
         if self.mode == "server":
-            all_prompts = gather_object(prompts)
-            # Always gather images (even when None) to avoid deadlock: images may be None on some ranks
-            # and non-None on others in mixed datasets, and gather_object is a collective operation.
-            all_images = gather_object(images if images is not None else [None] * len(prompts))
-            if all(img is None for img in all_images):
-                all_images = None
+            with profiler:
+                output = await self.vllm_client.agenerate(
+                    prompts=prompts,
+                    images=images,
+                    n=num_generations,
+                    repetition_penalty=repetition_penalty,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=0.0 if min_p is None else min_p,
+                    max_tokens=max_completion_length,
+                    logprobs=self.logprobs,
+                    structured_outputs_regex=self.structured_outputs_regex,
+                    generation_kwargs=self.generation_kwargs,
+                )
 
-            if accelerator.is_main_process:
-                # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and
-                # generate num_generations outputs for each one. This is faster than generating outputs for each
-                # duplicate prompt individually.
-                ordered_set_of_prompt_ids = all_prompts[::num_generations]
-                ordered_set_of_images = all_images[::num_generations] if all_images is not None else None
-
-                sampling_params = {
-                    "n": num_generations,
-                    "repetition_penalty": repetition_penalty,
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "top_k": top_k,
-                    "min_p": 0.0 if min_p is None else min_p,
-                    "max_tokens": max_completion_length,
-                    "logprobs": self.logprobs,
-                    "structured_outputs_regex": self.structured_outputs_regex,
-                    "generation_kwargs": self.generation_kwargs,
-                }
-                with profiler:
-                    output = self.vllm_client.generate(
-                        prompts=ordered_set_of_prompt_ids,
-                        images=ordered_set_of_images,
-                        **sampling_params,
-                    )
-                    payload = (
-                        output["prompt_ids"],
-                        output["completion_ids"],
-                        output["logprobs"],
-                        output.get("logprob_token_ids"),
-                    )
-            else:
-                payload = None
-
-            # Broadcast the completions from the main process to all processes, ensuring each process receives its corresponding slice.
-            obj_list = [payload]
-            broadcast_object_list(obj_list, from_process=0)
-            all_prompt_ids, all_completion_ids, all_logprobs, all_logprob_token_ids = obj_list[0]
-
-            # vllm_client.generate(n=num_generations) returns num_generations completions per prompt.
+            # agenerate(n=num_generations) returns num_generations completions per prompt.
             # Duplicate prompt_ids to align with per-completion entries.
-            all_prompt_ids = [ids for ids in all_prompt_ids for _ in range(num_generations)]
-
-            process_slice = slice(
-                accelerator.process_index * len(prompts),
-                (accelerator.process_index + 1) * len(prompts),
-            )
-            prompt_ids = all_prompt_ids[process_slice]
-            completion_ids = all_completion_ids[process_slice]
-            logprobs = all_logprobs[process_slice] if all_logprobs is not None else None
-            logprob_token_ids = all_logprob_token_ids[process_slice] if all_logprob_token_ids is not None else None
+            prompt_ids = [ids for ids in output["prompt_ids"] for _ in range(num_generations)]
+            completion_ids = output["completion_ids"]
+            logprobs = output["logprobs"]
+            logprob_token_ids = output.get("logprob_token_ids")
 
         # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
         elif self.mode == "colocate":

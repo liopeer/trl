@@ -120,7 +120,8 @@ RewardFunc = str | PreTrainedModel | Callable[..., list[float | None]]
 # What we call a rollout function is a callable that takes prompts (list) and the trainer instance as parameters and
 # returns a dict of generation results. Those results must include "prompt_ids", "completion_ids", and "logprobs"
 # fields. Any extra fields (per-completion) are forwarded to the reward functions.
-RolloutFunc = Callable[[list[str], "GRPOTrainer"], dict[str, Any]]
+# As everywhere, prompts can be in the standard (plain text) or conversational (structured messages) format.
+RolloutFunc = Callable[[list[str | list[dict[str, Any]]], "GRPOTrainer"], dict[str, Any]]
 
 
 class _SupportsReset(Protocol):
