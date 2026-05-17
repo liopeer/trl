@@ -471,12 +471,16 @@ def main(script_args: ScriptArguments):
                 if isinstance(msg, dict) and msg.get("status") == "ready":
                     ready_connections.add(connection)
 
-        # Start the logprob request batcher background task
+        # Start request batcher background tasks for all generation endpoints
         batcher_task = asyncio.create_task(_logprob_batcher())
+        generate_batcher_task = asyncio.create_task(_generate_batcher())
+        chat_batcher_task = asyncio.create_task(_chat_batcher())
 
         yield
 
         batcher_task.cancel()
+        generate_batcher_task.cancel()
+        chat_batcher_task.cancel()
 
         # Wait for processes to terminate
         for process in processes:
@@ -629,27 +633,11 @@ def main(script_args: ScriptArguments):
             generation_kwargs["structured_outputs"] = StructuredOutputsParams(**structured_outputs_kwargs)
         sampling_params = SamplingParams(**generation_kwargs)
 
-        # Evenly distribute prompts across DP ranks
-        chunked_prompts = chunk_list(prompts, script_args.data_parallel_size)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        await _generate_queue.put((prompts, sampling_params, future))
+        all_outputs = await future
 
-        # Send the prompts to each worker
-        for connection, prompts in zip(connections, chunked_prompts, strict=True):
-            # When the number of prompts is less than data_parallel_size, some workers will receive empty prompts.
-            # However, vLLM requires that we always send at least one prompt. So we send a placeholder prompt to comply
-            # with vLLM's requirement, and we later ignore the result.
-            if not prompts:
-                prompts = ["<placeholder>"]
-            kwargs = {"prompts": prompts, "sampling_params": sampling_params}
-            connection.send({"type": "call", "method": "generate", "kwargs": kwargs})
-
-        # Receive results
-        all_outputs = [connection.recv() for connection in connections]
-
-        # Handle empty prompts (see above)
-        all_outputs = [output for output, prompts in zip(all_outputs, chunked_prompts, strict=True) if prompts]
-
-        # Flatten and combine all results
-        all_outputs = list(chain.from_iterable(all_outputs))  # from list of list to single list
         prompt_ids = [output.prompt_token_ids for output in all_outputs]
         completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
         logprobs, logprob_token_ids = extract_logprobs(all_outputs)
@@ -689,6 +677,34 @@ def main(script_args: ScriptArguments):
             connection.send({"type": "call", "method": "generate", "kwargs": kwargs})
         all_outputs = [connection.recv() for connection in connections]
         all_outputs = [output for output, chunk in zip(all_outputs, chunked_prompts, strict=True) if chunk]
+        return list(chain.from_iterable(all_outputs))
+
+    def _run_generate(prompts, sampling_params):
+        """Send prompts to DP workers and collect outputs (runs in executor thread)."""
+        chunked = chunk_list(prompts, script_args.data_parallel_size)
+        for connection, chunk in zip(connections, chunked, strict=True):
+            if not chunk:
+                chunk = [{"prompt_token_ids": [0]}]
+            connection.send({"type": "call", "method": "generate",
+                             "kwargs": {"prompts": chunk, "sampling_params": sampling_params}})
+        all_outputs = [c.recv() for c in connections]
+        all_outputs = [o for o, chunk in zip(all_outputs, chunked, strict=True) if chunk]
+        return list(chain.from_iterable(all_outputs))
+
+    def _run_chat(messages, sampling_params, chat_template_kwargs, tools):
+        """Send messages to DP workers and collect outputs (runs in executor thread)."""
+        chunked = chunk_list(messages, script_args.data_parallel_size)
+        for connection, chunk in zip(connections, chunked, strict=True):
+            if not chunk:
+                chunk = [[{"role": "user", "content": "<placeholder>"}]]
+            connection.send({"type": "call", "method": "chat", "kwargs": {
+                "messages": chunk,
+                "sampling_params": sampling_params,
+                "chat_template_kwargs": chat_template_kwargs,
+                "tools": tools,
+            }})
+        all_outputs = [c.recv() for c in connections]
+        all_outputs = [o for o, chunk in zip(all_outputs, chunked, strict=True) if chunk]
         return list(chain.from_iterable(all_outputs))
 
     # ── Request batching for get_sequence_logprobs ──
@@ -788,6 +804,107 @@ def main(script_args: ScriptArguments):
                                 future.set_exception(e)
             except Exception as e:
                 # Prevent killing the batcher task — signal error to all unfulfilled futures
+                for *_, future in batch:
+                    if not future.done():
+                        future.set_exception(e)
+
+    # ── Request batching for /generate/ and /chat/ ──
+    # Same pattern as _logprob_batcher: concurrent endpoint handlers push to a queue
+    # and await a Future; the single batcher task collects them, dispatches as one
+    # batch via run_in_executor (keeping the event loop free), then resolves futures.
+    _generate_queue: asyncio.Queue = asyncio.Queue()
+    _chat_queue: asyncio.Queue = asyncio.Queue()
+
+    async def _generate_batcher():
+        """Background task: batch concurrent /generate/ requests and dispatch together."""
+        loop = asyncio.get_running_loop()
+        while True:
+            batch = []
+            try:
+                item = await _generate_queue.get()
+                batch.append(item)
+                deadline = loop.time() + _BATCH_WAIT_S
+                while len(batch) < _MAX_BATCH_REQUESTS:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        batch.append(await asyncio.wait_for(_generate_queue.get(), timeout=remaining))
+                    except asyncio.TimeoutError:
+                        break
+
+                # Group by sampling_params so prompts with identical params are batched together.
+                groups: dict = {}
+                for prompts, sampling_params, future in batch:
+                    groups.setdefault(repr(sampling_params), []).append((prompts, sampling_params, future))
+
+                for items in groups.values():
+                    all_prompts: list = []
+                    offsets: list = []
+                    sampling_params = items[0][1]
+                    for prompts, _, _ in items:
+                        offsets.append((len(all_prompts), len(prompts)))
+                        all_prompts.extend(prompts)
+                    try:
+                        all_outputs = await loop.run_in_executor(None, _run_generate, all_prompts, sampling_params)
+                        for (start, count), (_, _, future) in zip(offsets, items, strict=True):
+                            if not future.done():
+                                future.set_result(all_outputs[start : start + count])
+                    except Exception as e:
+                        for _, _, future in items:
+                            if not future.done():
+                                future.set_exception(e)
+            except Exception as e:
+                for *_, future in batch:
+                    if not future.done():
+                        future.set_exception(e)
+
+    async def _chat_batcher():
+        """Background task: batch concurrent /chat/ requests and dispatch together."""
+        loop = asyncio.get_running_loop()
+        while True:
+            batch = []
+            try:
+                item = await _chat_queue.get()
+                batch.append(item)
+                deadline = loop.time() + _BATCH_WAIT_S
+                while len(batch) < _MAX_BATCH_REQUESTS:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        batch.append(await asyncio.wait_for(_chat_queue.get(), timeout=remaining))
+                    except asyncio.TimeoutError:
+                        break
+
+                # Group by (sampling_params, tools, chat_template_kwargs) — all must match
+                # for a valid batch since they affect how each message list is rendered.
+                groups: dict = {}
+                for messages, sampling_params, chat_template_kwargs, tools, future in batch:
+                    key = (repr(sampling_params), repr(tools), repr(chat_template_kwargs))
+                    groups.setdefault(key, []).append(
+                        (messages, sampling_params, chat_template_kwargs, tools, future)
+                    )
+
+                for items in groups.values():
+                    all_messages: list = []
+                    offsets: list = []
+                    _, sampling_params, chat_template_kwargs, tools, _ = items[0]
+                    for messages, *_, _ in items:
+                        offsets.append((len(all_messages), len(messages)))
+                        all_messages.extend(messages)
+                    try:
+                        all_outputs = await loop.run_in_executor(
+                            None, _run_chat, all_messages, sampling_params, chat_template_kwargs, tools
+                        )
+                        for (start, count), (*_, future) in zip(offsets, items, strict=True):
+                            if not future.done():
+                                future.set_result(all_outputs[start : start + count])
+                    except Exception as e:
+                        for *_, future in items:
+                            if not future.done():
+                                future.set_exception(e)
+            except Exception as e:
                 for *_, future in batch:
                     if not future.done():
                         future.set_exception(e)
@@ -1080,32 +1197,15 @@ def main(script_args: ScriptArguments):
             generation_kwargs["structured_outputs"] = StructuredOutputsParams(**structured_outputs_kwargs)
         sampling_params = SamplingParams(**generation_kwargs)
 
-        # Evenly distribute prompts across DP ranks
-        chunked_messages = chunk_list(request.messages, script_args.data_parallel_size)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        await _chat_queue.put((
+            request.messages, sampling_params,
+            request.chat_template_kwargs or {}, request.tools,
+            future,
+        ))
+        all_outputs = await future
 
-        # Send the messages to each worker
-        for connection, messages in zip(connections, chunked_messages, strict=True):
-            # When the number of messages is less than data_parallel_size, some workers will receive empty messages.
-            # However, vLLM requires that we always send at least one prompt. So we send a placeholder prompt to comply
-            # with vLLM's requirement, and we later ignore the result.
-            if not messages:
-                messages = [[{"role": "user", "content": "<placeholder>"}]]
-            kwargs = {
-                "messages": messages,
-                "sampling_params": sampling_params,
-                "chat_template_kwargs": request.chat_template_kwargs,
-                "tools": request.tools,
-            }
-            connection.send({"type": "call", "method": "chat", "kwargs": kwargs})
-
-        # Receive results
-        all_outputs = [connection.recv() for connection in connections]
-
-        # Handle empty prompts (see above)
-        all_outputs = [output for output, prompts in zip(all_outputs, chunked_messages, strict=True) if prompts]
-
-        # Flatten and combine all results
-        all_outputs = list(chain.from_iterable(all_outputs))  # from list of list to single list
         prompt_ids = [output.prompt_token_ids for output in all_outputs]
         completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
         logprobs, logprob_token_ids = extract_logprobs(all_outputs)
